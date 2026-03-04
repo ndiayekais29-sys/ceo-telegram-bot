@@ -1,21 +1,20 @@
 """
-CEO-AI v4 — SYSTÈME COMPLET
-10 agents + Chaîne autonome + Finance + Legal + SEO + Closer + Webhook Stripe + Multi-users
+CEO-AI v4 — GEMINI EDITION
+13 agents + Chaîne autonome + Supabase + Alertes matinales
+Utilise google-generativeai (Gemini 1.5 Flash) — GRATUIT
 """
 
 import os
 import json
 import logging
 import asyncio
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 
-import anthropic
+import google.generativeai as genai
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -25,20 +24,63 @@ from telegram.constants import ParseMode, ChatAction
 
 load_dotenv()
 
-TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN")
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY")
-SUPABASE_URL    = os.getenv("SUPABASE_URL")
-SUPABASE_KEY    = os.getenv("SUPABASE_KEY")
-GMAIL_ADDRESS   = os.getenv("GMAIL_ADDRESS")
-GMAIL_PASSWORD  = os.getenv("GMAIL_PASSWORD")
-STRIPE_SECRET   = os.getenv("STRIPE_SECRET_KEY")
-ADMIN_ID        = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_KEY     = os.getenv("GEMINI_API_KEY")
+SUPABASE_URL   = os.getenv("SUPABASE_URL")
+SUPABASE_KEY   = os.getenv("SUPABASE_KEY")
+STRIPE_SECRET  = os.getenv("STRIPE_SECRET_KEY")
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("CEO_BOT")
 
+# Configure Gemini
+genai.configure(api_key=GEMINI_KEY)
+
 # ─────────────────────────────────────────────────────
-#  SUPABASE
+#  APPEL GEMINI
+# ─────────────────────────────────────────────────────
+
+def gemini_call(system_prompt: str, history: list, max_tokens: int = 1500) -> str:
+    """Appelle Gemini 1.5 Flash avec historique de conversation."""
+    try:
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_prompt
+        )
+
+        # Convertir l'historique au format Gemini
+        gemini_history = []
+        messages = history[-20:]
+
+        for msg in messages[:-1]:  # Tout sauf le dernier
+            role = "user" if msg["role"] == "user" else "model"
+            gemini_history.append({"role": role, "parts": [msg["content"]]})
+
+        chat = model.start_chat(history=gemini_history)
+
+        # Dernier message
+        last_msg = messages[-1]["content"] if messages else "Bonjour"
+        response = chat.send_message(last_msg)
+        return response.text
+
+    except Exception as e:
+        log.error(f"Gemini error: {e}")
+        return f"❌ Erreur Gemini : {e}"
+
+def gemini_quick(system_prompt: str, message: str, max_tokens: int = 100) -> str:
+    """Appel Gemini simple sans historique (pour le routeur)."""
+    try:
+        model = genai.GenerativeModel(
+            model_name="gemini-1.5-flash",
+            system_instruction=system_prompt
+        )
+        response = model.generate_content(message)
+        return response.text.strip()
+    except Exception as e:
+        return "ceo"
+
+# ─────────────────────────────────────────────────────
+#  SUPABASE — MÉMOIRE LONGUE
 # ─────────────────────────────────────────────────────
 
 def _default_memory():
@@ -114,9 +156,8 @@ async def db_get_all_users() -> list:
 # ─────────────────────────────────────────────────────
 
 async def check_stripe_revenue() -> str:
-    """Récupère le MRR réel depuis Stripe."""
     if not STRIPE_SECRET:
-        return "❌ Stripe non configuré"
+        return "❌ Stripe non configuré — ajoute STRIPE_SECRET_KEY dans les variables"
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
@@ -131,8 +172,44 @@ async def check_stripe_revenue() -> str:
         return f"❌ Erreur Stripe : {e}"
 
 # ─────────────────────────────────────────────────────
-#  PROMPTS DES 17 AGENTS
+#  PROMPTS DES 13 AGENTS
 # ─────────────────────────────────────────────────────
+
+CEO_PROMPT = """Tu es CEO-AI, l'orchestrateur principal d'un système de 13 agents autonomes.
+LANGUE : Détecte la langue de l'utilisateur et réponds toujours dans la même langue.
+Tu coordonnes tous les agents. Tu parles comme un vrai CEO : direct, confiant, sans blabla.
+Propose toujours une action suivante logique."""
+
+MORNING_REPORT_PROMPT = """Tu es CEO-AI. Génère un rapport matinal motivant et actionnable en français.
+Format :
+🌅 Bonjour ! Voici ton brief CEO du jour.
+📊 SITUATION : [cycles, niche, MRR]
+🎯 PRIORITÉ DU JOUR : [1 action concrète]
+⚡ 3 TÂCHES RAPIDES : [3 micro-tâches moins de 30 min]
+💡 INSIGHT : [1 conseil stratégique]
+🚀 OBJECTIF SEMAINE : [1 objectif mesurable]
+Max 200 mots."""
+
+ROUTER_PROMPT = """Analyse le message et retourne UNIQUEMENT le nom de l'agent parmi :
+scout, oracle, forge, pulse, lens, design, code, spy, social, closer, finance, legal, seo, ceo
+
+Règles :
+- marché, niche, opportunité, explorer → scout
+- choisir, sélectionner, stratégie → oracle
+- produit, SaaS, features, pricing, MVP → forge
+- marketing, posts, scripts, publicité → pulse
+- métriques, analytics, KPI, scale, pivot → lens
+- landing page, site, HTML → design
+- code, script, automatisation, Python → code
+- concurrents, analyse → spy
+- réseaux sociaux, Instagram, LinkedIn posts → social
+- prospection, DM, closing, vente → closer
+- finance, MRR, ARR, rentabilité, churn → finance
+- juridique, CGV, contrat, RGPD → legal
+- SEO, article, blog, référencement → seo
+- tout le reste → ceo
+
+Retourne UNIQUEMENT le mot clé, rien d'autre."""
 
 AGENTS = {
     "scout": {
@@ -173,74 +250,41 @@ AGENTS = {
     },
     "closer": {
         "emoji": "🎯", "name": "CLOSER",
-        "prompt": "Tu es l'agent CLOSER, expert en prospection et closing.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère : 20 messages LinkedIn/DM personnalisés par cible, séquences de follow-up (J+0, J+3, J+7), scripts d'appel de vente, réponses aux objections courantes, taux de conversion estimé par approche."
+        "prompt": "Tu es l'agent CLOSER, expert en prospection et closing.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère : 20 messages LinkedIn/DM personnalisés, séquences follow-up J+0/J+3/J+7, scripts d'appel, réponses aux objections, taux de conversion estimé."
     },
     "finance": {
         "emoji": "💰", "name": "FINANCE",
-        "prompt": "Tu es l'agent FINANCE, expert en finances SaaS.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nAnalyse : MRR, ARR, churn rate, CAC, LTV, ratio LTV/CAC, runway, break-even point, marges. Donne des recommandations pour optimiser la rentabilité. Si les chiffres manquent, demande-les."
+        "prompt": "Tu es l'agent FINANCE, expert en finances SaaS.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nAnalyse : MRR, ARR, churn rate, CAC, LTV, ratio LTV/CAC, runway, break-even, marges. Recommandations pour optimiser la rentabilité."
     },
     "legal": {
         "emoji": "⚖️", "name": "LEGAL",
-        "prompt": "Tu es l'agent LEGAL, expert en documents juridiques pour SaaS.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère des documents complets et professionnels : CGV, politique de confidentialité RGPD, mentions légales, contrats clients, conditions d'utilisation. Adapte selon le pays et le type de SaaS. Précise toujours que ce n'est pas un avis juridique officiel."
+        "prompt": "Tu es l'agent LEGAL, expert en documents juridiques SaaS.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère : CGV, politique de confidentialité RGPD, mentions légales, contrats clients. Précise que ce n'est pas un avis juridique officiel."
     },
     "seo": {
         "emoji": "📈", "name": "SEO",
-        "prompt": "Tu es l'agent SEO, expert en référencement et contenu.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère : articles de blog 1500-2000 mots optimisés SEO, meta titles, meta descriptions, structure H1/H2/H3, mots-clés cibles, liens internes suggérés, score de difficulté du mot-clé. Contenu prêt à publier."
+        "prompt": "Tu es l'agent SEO, expert en référencement.\nLANGUE : Réponds dans la même langue que l'utilisateur.\nGénère : articles de blog 1500-2000 mots optimisés SEO, meta titles, meta descriptions, structure H1/H2/H3, mots-clés cibles. Contenu prêt à publier."
     },
 }
-
-CEO_PROMPT = """Tu es CEO-AI, l'orchestrateur principal d'un système de 13 agents autonomes.
-LANGUE : Détecte la langue de l'utilisateur et réponds toujours dans la même langue.
-Tu coordonnes tous les agents. Tu parles comme un vrai CEO : direct, confiant, sans blabla.
-Propose toujours une action suivante logique."""
-
-MORNING_REPORT_PROMPT = """Tu es CEO-AI. Génère un rapport matinal motivant et actionnable en français.
-Format :
-🌅 Bonjour ! Voici ton brief CEO du jour.
-📊 SITUATION : [cycles, niche, MRR]
-🎯 PRIORITÉ DU JOUR : [1 action concrète]
-⚡ 3 TÂCHES RAPIDES : [3 micro-tâches < 30 min]
-💡 INSIGHT : [1 conseil stratégique]
-🚀 OBJECTIF SEMAINE : [1 objectif mesurable]
-Max 200 mots."""
-
-ROUTER_PROMPT = """Analyse le message et retourne UNIQUEMENT le nom de l'agent :
-scout, oracle, forge, pulse, lens, design, code, spy, social, closer, finance, legal, seo, ceo
-
-- marché, niche, opportunité, explorer → scout
-- choisir, sélectionner, stratégie → oracle
-- produit, SaaS, features, pricing, MVP → forge
-- marketing, posts, scripts, publicité → pulse
-- métriques, analytics, KPI, scale, pivot → lens
-- landing page, site, HTML → design
-- code, script, automatisation, Python → code
-- concurrents, analyse → spy
-- réseaux sociaux, Instagram, LinkedIn posts → social
-- prospection, DM, closing, vente, closer → closer
-- finance, MRR, ARR, rentabilité, churn → finance
-- juridique, CGV, contrat, RGPD, legal → legal
-- SEO, article, blog, référencement → seo
-- tout le reste → ceo
-
-Retourne UNIQUEMENT le mot clé."""
 
 # ─────────────────────────────────────────────────────
 #  CHAÎNE AUTONOME
 # ─────────────────────────────────────────────────────
 
 CHAIN_STEPS = [
-    ("scout",  "Explore le marché. Génère 20 niches scorées et identifie la meilleure opportunité."),
-    ("oracle", "Analyse les niches et sélectionne la meilleure avec justification complète."),
-    ("forge",  "Conçois le produit micro-SaaS complet pour la niche sélectionnée."),
-    ("pulse",  "Génère le plan marketing complet : 10 posts, 5 emails, 3 scripts, 5 hooks."),
-    ("seo",    "Génère un article SEO de 1500 mots pour attirer du trafic vers ce produit."),
-    ("closer", "Génère 20 messages de prospection LinkedIn pour ce produit."),
+    ("scout",   "Explore le marché. Génère 20 niches scorées et identifie la meilleure."),
+    ("oracle",  "Analyse les niches et sélectionne la meilleure avec justification complète."),
+    ("forge",   "Conçois le produit micro-SaaS complet pour la niche sélectionnée."),
+    ("pulse",   "Génère le plan marketing complet : 10 posts, 5 emails, 3 scripts, 5 hooks."),
+    ("seo",     "Génère un article SEO de 1500 mots pour attirer du trafic vers ce produit."),
+    ("closer",  "Génère 20 messages de prospection LinkedIn pour ce produit."),
 ]
 
 async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
-    """Exécute la chaîne complète d'agents automatiquement."""
-    await bot.send_message(chat_id=chat_id, text="🔄 *Chaîne autonome lancée — 6 agents vont s'exécuter automatiquement*", parse_mode=ParseMode.MARKDOWN)
-
+    await bot.send_message(
+        chat_id=chat_id,
+        text="🔄 *Chaîne autonome lancée — 6 agents vont s'exécuter automatiquement*",
+        parse_mode=ParseMode.MARKDOWN
+    )
     memory = await db_load(user_id)
     context_summary = ""
 
@@ -252,29 +296,19 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
         )
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-        # Enrichir le contexte avec les résultats précédents
         full_task = task
         if context_summary:
             full_task += f"\n\nContexte des étapes précédentes :\n{context_summary}"
 
         memory["history"].append({"role": "user", "content": full_task})
 
-        try:
-            client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-            response = client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=1200,
-                system=agent["prompt"],
-                messages=memory["history"][-20:],
-            )
-            reply = f"{agent['emoji']} *Agent {agent['name']}*\n{'─'*25}\n\n{response.content[0].text}"
-            memory["history"].append({"role": "assistant", "content": reply})
-            context_summary += f"\n[{agent['name']}] : {response.content[0].text[:200]}..."
+        reply_text = gemini_call(agent["prompt"], memory["history"])
+        prefix = f"{agent['emoji']} *Agent {agent['name']}*\n{'─'*25}\n\n"
+        reply = prefix + reply_text
 
-        except Exception as e:
-            reply = f"❌ Erreur agent {agent['name']} : {e}"
+        memory["history"].append({"role": "assistant", "content": reply_text})
+        context_summary += f"\n[{agent['name']}] : {reply_text[:200]}..."
 
-        # Envoyer le résultat
         chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
         for chunk in chunks:
             await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
@@ -287,62 +321,34 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
 
     await bot.send_message(
         chat_id=chat_id,
-        text="✅ *Chaîne autonome terminée !*\n\nTon CEO-AI a complété les 6 étapes. Tout est prêt.",
+        text="✅ *Chaîne autonome terminée ! 6 étapes complétées.*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=main_keyboard()
     )
 
 # ─────────────────────────────────────────────────────
-#  APPELS IA
+#  TRAITEMENT DES MESSAGES
 # ─────────────────────────────────────────────────────
 
 async def route_message(message: str) -> str:
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=20,
-            system=ROUTER_PROMPT,
-            messages=[{"role": "user", "content": message}]
-        )
-        agent = response.content[0].text.strip().lower()
-        return agent if agent in AGENTS or agent == "ceo" else "ceo"
-    except:
-        return "ceo"
+    result = gemini_quick(ROUTER_PROMPT, message)
+    agent = result.strip().lower().split()[0] if result else "ceo"
+    return agent if agent in AGENTS or agent == "ceo" else "ceo"
 
 async def call_agent(agent_key: str, history: list) -> str:
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        if agent_key in AGENTS:
-            agent = AGENTS[agent_key]
-            system = agent["prompt"]
-            prefix = f"{agent['emoji']} Agent {agent['name']} activé\n{'─'*30}\n\n"
-        else:
-            system = CEO_PROMPT
-            prefix = "🤖 CEO-AI\n"
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=1500,
-            system=system,
-            messages=history[-20:],
-        )
-        return prefix + response.content[0].text
-    except Exception as e:
-        return f"❌ Erreur : {e}"
+    if agent_key in AGENTS:
+        agent = AGENTS[agent_key]
+        system = agent["prompt"]
+        prefix = f"{agent['emoji']} Agent {agent['name']} activé\n{'─'*30}\n\n"
+    else:
+        system = CEO_PROMPT
+        prefix = "🤖 CEO-AI\n"
+    reply = gemini_call(system, history)
+    return prefix + reply
 
 async def generate_morning_report(memory: dict) -> str:
-    try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-        context = f"Cycles={memory['cycles']}, niche={memory.get('niche','aucune')}, MRR=${memory.get('mrr',0)}, dépenses=${memory.get('expenses',0)}, dernier agent={memory.get('last_agent','aucun')}"
-        response = client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=600,
-            system=MORNING_REPORT_PROMPT,
-            messages=[{"role": "user", "content": context}]
-        )
-        return response.content[0].text
-    except Exception as e:
-        return f"❌ Erreur rapport : {e}"
+    context = f"Cycles={memory['cycles']}, niche={memory.get('niche','aucune')}, MRR=${memory.get('mrr',0)}, dépenses=${memory.get('expenses',0)}, dernier agent={memory.get('last_agent','aucun')}"
+    return gemini_call(MORNING_REPORT_PROMPT, [{"role": "user", "content": context}])
 
 async def process_message(user_id: int, user_message: str, force_agent: str = None) -> str:
     memory = await db_load(user_id)
@@ -384,7 +390,7 @@ async def morning_scheduler(bot: Bot):
         await asyncio.sleep(30)
 
 # ─────────────────────────────────────────────────────
-#  CLAVIER
+#  CLAVIER TELEGRAM
 # ─────────────────────────────────────────────────────
 
 def main_keyboard():
@@ -420,34 +426,35 @@ QUICK_MESSAGES = {
     "agent_closer":  "Génère 20 messages LinkedIn de prospection pour mon SaaS B2B.",
     "agent_finance": "Analyse mes finances : MRR $2,400, churn 5%, CAC $45, dépenses $800/mois.",
     "agent_legal":   "Génère les CGV et politique de confidentialité RGPD pour mon SaaS.",
-    "agent_seo":     "Génère un article SEO de 1500 mots sur l'automatisation des relances B2B.",
+    "agent_seo":     "Génère un article SEO de 1500 mots sur l'automatisation B2B.",
 }
 
 FORCE_AGENTS = {k: k.replace("agent_", "") for k in QUICK_MESSAGES if k.startswith("agent_")}
 
 # ─────────────────────────────────────────────────────
-#  HANDLERS
+#  HANDLERS TELEGRAM
 # ─────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = (
-        f"🤖 *CEO-AI v4 COMPLET — Bonjour {user.first_name} !*\n\n"
+        f"🤖 *CEO-AI v4 Gemini — Bonjour {user.first_name} !*\n\n"
         "13 agents spécialisés + chaîne autonome :\n\n"
         "🔍 SCOUT · 🎯 ORACLE · ⚡ FORGE · 📣 PULSE\n"
         "📊 LENS · 🎨 DESIGN · 💻 CODE · 🔎 SPY\n"
         "📱 SOCIAL · 🎯 CLOSER · 💰 FINANCE\n"
         "⚖️ LEGAL · 📈 SEO\n\n"
-        "🔄 *Chaîne autonome* — 6 agents s'enchaînent seuls\n"
-        "📋 *Rapport matinal* — Brief CEO chaque matin à 9h\n"
-        "💳 *Stripe* — Suivi revenus en temps réel\n\n"
+        "🔄 Chaîne autonome — 6 agents s'enchaînent seuls\n"
+        "📋 Rapport matinal automatique à 9h\n"
+        "💳 Suivi Stripe en temps réel\n\n"
+        "Powered by Gemini 1.5 Flash\n\n"
         "Écris-moi ou choisis un agent 👇"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
 
 async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mem = await db_load(update.effective_user.id)
-    margin = mem.get('mrr', 0) - mem.get('expenses', 0)
+    margin = mem.get("mrr", 0) - mem.get("expenses", 0)
     await update.message.reply_text(
         f"🧠 *Mémoire CEO-AI :*\n\n"
         f"• Cycles : {mem['cycles']}\n"
@@ -457,7 +464,8 @@ async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"• Marge : ${margin}\n"
         f"• Dernier agent : {mem.get('last_agent') or 'Aucun'}\n"
         f"• Messages : {len(mem['history'])}",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard()
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard()
     )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +473,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply = await process_message(update.effective_user.id, update.message.text)
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
-        await update.message.reply_text(chunk, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
+        await update.message.reply_text(
+            chunk,
+            reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+        )
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -474,14 +485,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
 
     if action == "memory":
-        await memory_cmd_callback(query)
+        mem = await db_load(user_id)
+        await query.message.reply_text(
+            f"🧠 Cycles: {mem['cycles']} | MRR: ${mem.get('mrr',0)} | Agent: {mem.get('last_agent','Aucun')}",
+            reply_markup=main_keyboard()
+        )
         return
 
     if action == "report":
         await ctx.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
         mem = await db_load(user_id)
         report = await generate_morning_report(mem)
-        await query.message.reply_text(f"📋 *BRIEF CEO*\n\n{report}", parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+        await query.message.reply_text(
+            f"📋 *BRIEF CEO*\n\n{report}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_keyboard()
+        )
         return
 
     if action == "stripe":
@@ -500,15 +519,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply = await process_message(user_id, msg, force_agent=force)
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
-        await query.message.reply_text(chunk, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
-
-async def memory_cmd_callback(query):
-    user_id = query.from_user.id
-    mem = await db_load(user_id)
-    await query.message.reply_text(
-        f"🧠 Cycles: {mem['cycles']} | MRR: ${mem.get('mrr',0)} | Agent: {mem.get('last_agent','Aucun')}",
-        reply_markup=main_keyboard()
-    )
+        await query.message.reply_text(
+            chunk,
+            reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+        )
 
 async def post_init(app: Application):
     asyncio.create_task(morning_scheduler(app.bot))
@@ -522,11 +536,11 @@ def main():
     if not TELEGRAM_TOKEN:
         log.error("TELEGRAM_TOKEN manquant !")
         return
-    if not ANTHROPIC_KEY:
-        log.error("ANTHROPIC_API_KEY manquant !")
+    if not GEMINI_KEY:
+        log.error("GEMINI_API_KEY manquant !")
         return
 
-    log.info("🚀 CEO-AI v4 COMPLET démarré...")
+    log.info("🚀 CEO-AI v4 Gemini démarré...")
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -537,9 +551,8 @@ def main():
     app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("✅ 13 agents + chaîne autonome + Stripe + alertes actifs !")
+    log.info("✅ 13 agents Gemini + chaîne autonome + alertes actifs !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
-
