@@ -1,7 +1,7 @@
 """
-CEO-AI v4 — GEMINI EDITION
+CEO-AI v4 — GEMINI EDITION CORRIGÉE
 13 agents + Chaîne autonome + Supabase + Alertes matinales
-Utilise google-generativeai (Gemini 1.5 Flash) — GRATUIT
+Utilise google-generativeai (Gemini 1.5 Flash Latest) — GRATUIT
 """
 
 import os
@@ -35,52 +35,56 @@ log = logging.getLogger("CEO_BOT")
 
 # Configure Gemini
 genai.configure(api_key=GEMINI_KEY)
+MODEL_NAME = "gemini-1.5-flash-latest"
 
 # ─────────────────────────────────────────────────────
-#  APPEL GEMINI
+#  APPELS GEMINI CORRIGES
 # ─────────────────────────────────────────────────────
 
 def gemini_call(system_prompt: str, history: list, max_tokens: int = 1500) -> str:
-    """Appelle Gemini 1.5 Flash avec historique de conversation."""
     try:
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=system_prompt
+            model_name=MODEL_NAME,
+            system_instruction=system_prompt,
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=max_tokens,
+                temperature=0.7,
+            )
         )
-
-        # Convertir l'historique au format Gemini
         gemini_history = []
         messages = history[-20:]
-
-        for msg in messages[:-1]:  # Tout sauf le dernier
+        for msg in messages[:-1]:
             role = "user" if msg["role"] == "user" else "model"
-            gemini_history.append({"role": role, "parts": [msg["content"]]})
-
+            gemini_history.append({
+                "role": role,
+                "parts": [{"text": msg["content"]}]
+            })
         chat = model.start_chat(history=gemini_history)
-
-        # Dernier message
         last_msg = messages[-1]["content"] if messages else "Bonjour"
         response = chat.send_message(last_msg)
         return response.text
-
     except Exception as e:
         log.error(f"Gemini error: {e}")
         return f"❌ Erreur Gemini : {e}"
 
-def gemini_quick(system_prompt: str, message: str, max_tokens: int = 100) -> str:
-    """Appel Gemini simple sans historique (pour le routeur)."""
+def gemini_quick(system_prompt: str, message: str) -> str:
     try:
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
-            system_instruction=system_prompt
+            model_name=MODEL_NAME,
+            system_instruction=system_prompt,
+            generation_config=genai.GenerationConfig(
+                max_output_tokens=50,
+                temperature=0.1,
+            )
         )
         response = model.generate_content(message)
         return response.text.strip()
     except Exception as e:
+        log.error(f"Gemini quick error: {e}")
         return "ceo"
 
 # ─────────────────────────────────────────────────────
-#  SUPABASE — MÉMOIRE LONGUE
+#  SUPABASE — MEMOIRE LONGUE
 # ─────────────────────────────────────────────────────
 
 def _default_memory():
@@ -172,7 +176,7 @@ async def check_stripe_revenue() -> str:
         return f"❌ Erreur Stripe : {e}"
 
 # ─────────────────────────────────────────────────────
-#  PROMPTS DES 13 AGENTS
+#  PROMPTS 13 AGENTS
 # ─────────────────────────────────────────────────────
 
 CEO_PROMPT = """Tu es CEO-AI, l'orchestrateur principal d'un système de 13 agents autonomes.
@@ -267,16 +271,16 @@ AGENTS = {
 }
 
 # ─────────────────────────────────────────────────────
-#  CHAÎNE AUTONOME
+#  CHAINE AUTONOME
 # ─────────────────────────────────────────────────────
 
 CHAIN_STEPS = [
-    ("scout",   "Explore le marché. Génère 20 niches scorées et identifie la meilleure."),
-    ("oracle",  "Analyse les niches et sélectionne la meilleure avec justification complète."),
-    ("forge",   "Conçois le produit micro-SaaS complet pour la niche sélectionnée."),
-    ("pulse",   "Génère le plan marketing complet : 10 posts, 5 emails, 3 scripts, 5 hooks."),
-    ("seo",     "Génère un article SEO de 1500 mots pour attirer du trafic vers ce produit."),
-    ("closer",  "Génère 20 messages de prospection LinkedIn pour ce produit."),
+    ("scout",  "Explore le marché. Génère 20 niches scorées et identifie la meilleure."),
+    ("oracle", "Analyse les niches et sélectionne la meilleure avec justification complète."),
+    ("forge",  "Conçois le produit micro-SaaS complet pour la niche sélectionnée."),
+    ("pulse",  "Génère le plan marketing complet : 10 posts, 5 emails, 3 scripts, 5 hooks."),
+    ("seo",    "Génère un article SEO de 1500 mots pour attirer du trafic vers ce produit."),
+    ("closer", "Génère 20 messages de prospection LinkedIn pour ce produit."),
 ]
 
 async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
@@ -301,17 +305,18 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
             full_task += f"\n\nContexte des étapes précédentes :\n{context_summary}"
 
         memory["history"].append({"role": "user", "content": full_task})
-
         reply_text = gemini_call(agent["prompt"], memory["history"])
         prefix = f"{agent['emoji']} *Agent {agent['name']}*\n{'─'*25}\n\n"
         reply = prefix + reply_text
-
         memory["history"].append({"role": "assistant", "content": reply_text})
         context_summary += f"\n[{agent['name']}] : {reply_text[:200]}..."
 
         chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
         for chunk in chunks:
-            await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
+            except:
+                await bot.send_message(chat_id=chat_id, text=chunk)
 
         await asyncio.sleep(2)
 
@@ -327,7 +332,7 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
     )
 
 # ─────────────────────────────────────────────────────
-#  TRAITEMENT DES MESSAGES
+#  TRAITEMENT MESSAGES
 # ─────────────────────────────────────────────────────
 
 async def route_message(message: str) -> str:
@@ -390,7 +395,7 @@ async def morning_scheduler(bot: Bot):
         await asyncio.sleep(30)
 
 # ─────────────────────────────────────────────────────
-#  CLAVIER TELEGRAM
+#  CLAVIER
 # ─────────────────────────────────────────────────────
 
 def main_keyboard():
@@ -432,7 +437,7 @@ QUICK_MESSAGES = {
 FORCE_AGENTS = {k: k.replace("agent_", "") for k in QUICK_MESSAGES if k.startswith("agent_")}
 
 # ─────────────────────────────────────────────────────
-#  HANDLERS TELEGRAM
+#  HANDLERS
 # ─────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -473,10 +478,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply = await process_message(update.effective_user.id, update.message.text)
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
-        await update.message.reply_text(
-            chunk,
-            reply_markup=main_keyboard() if i == len(chunks) - 1 else None
-        )
+        try:
+            await update.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+            )
+        except:
+            await update.message.reply_text(
+                chunk,
+                reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+            )
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -496,11 +508,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
         mem = await db_load(user_id)
         report = await generate_morning_report(mem)
-        await query.message.reply_text(
-            f"📋 *BRIEF CEO*\n\n{report}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=main_keyboard()
-        )
+        try:
+            await query.message.reply_text(
+                f"📋 *BRIEF CEO*\n\n{report}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard()
+            )
+        except:
+            await query.message.reply_text(report, reply_markup=main_keyboard())
         return
 
     if action == "stripe":
@@ -519,10 +534,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     reply = await process_message(user_id, msg, force_agent=force)
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
-        await query.message.reply_text(
-            chunk,
-            reply_markup=main_keyboard() if i == len(chunks) - 1 else None
-        )
+        try:
+            await query.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+            )
+        except:
+            await query.message.reply_text(
+                chunk,
+                reply_markup=main_keyboard() if i == len(chunks) - 1 else None
+            )
 
 async def post_init(app: Application):
     asyncio.create_task(morning_scheduler(app.bot))
@@ -556,3 +578,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
