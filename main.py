@@ -240,36 +240,220 @@ CHAIN_STEPS = [
     ("closer",  "Génère 20 messages LinkedIn de prospection pour ce produit."),
 ]
 
+# ─────────────────────────────────────────────────────
+#  PILIER 3 — CONSTANTES QUOTA
+# ─────────────────────────────────────────────────────
+
+INTER_AGENT_DELAY = 10    # 10s entre chaque agent
+RETRY_DELAY_429   = 65    # 65s si erreur 429
+MAX_RETRIES       = 3     # Tentatives max
+MAX_CONTEXT_CHARS = 400   # Mémoire courte
+
+def truncate_context(text: str) -> str:
+    if len(text) <= MAX_CONTEXT_CHARS:
+        return text
+    return text[:MAX_CONTEXT_CHARS] + "...[résumé]"
+
+# ─────────────────────────────────────────────────────
+#  PILIER 1 — APPEL GEMINI AVEC AUTO-RETRY
+# ─────────────────────────────────────────────────────
+
+def gemini_call_safe(system_prompt: str, history: list, max_tokens: int = 1000):
+    """Gemini avec retry automatique 429 + mémoire courte."""
+    import time
+    short_history = history[-6:]
+    contents = []
+    for msg in short_history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(
+            role=role,
+            parts=[types.Part(text=truncate_context(msg["content"]))]
+        ))
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client_gemini.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=max_tokens,
+                    temperature=0.7,
+                )
+            )
+            return response.text, True
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                wait = RETRY_DELAY_429 * attempt
+                log.warning(f"⏳ Quota 429 — Attente {wait}s (tentative {attempt}/{MAX_RETRIES})")
+                time.sleep(wait)
+            elif "503" in err or "unavailable" in err.lower():
+                time.sleep(30 * attempt)
+            else:
+                return f"ERREUR: {err}", False
+    return "ERREUR: Quota épuisé après tous les retries", False
+
+# ─────────────────────────────────────────────────────
+#  PILIER 2 — BOUCLE DE PENSÉE RÉCURSIVE
+# ─────────────────────────────────────────────────────
+
+async def think_aloud(bot: Bot, chat_id: int, agent_name: str, task: str, context: str):
+    """L'agent écrit ses pensées avant d'agir."""
+    thought, ok = gemini_call_safe(
+        f"Tu es {agent_name}. Avant d'agir, réfléchis en 3 points : 💭 Pensées | 🧠 Raisonnement | 📋 Plan (max 120 mots). Contexte: {truncate_context(context)}",
+        [{"role": "user", "content": task}],
+        max_tokens=180
+    )
+    if ok:
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"🧠 *{agent_name} — Réflexion*\n{'─'*20}\n\n{thought}", parse_mode=ParseMode.MARKDOWN)
+        except:
+            await bot.send_message(chat_id=chat_id, text=f"🧠 {agent_name}: {thought}")
+
+async def lens_repair(bot: Bot, chat_id: int, failed_agent: str, error: str, task: str) -> str:
+    """LENS analyse l'erreur et propose une tâche corrigée."""
+    await bot.send_message(chat_id=chat_id, text=f"🔧 *LENS répare {failed_agent}*\nErreur: `{error[:150]}`", parse_mode=ParseMode.MARKDOWN)
+    fix, ok = gemini_call_safe(
+        "Tu es LENS. Un agent a échoué. Propose une version SIMPLIFIÉE de la tâche (max 80 mots). Réponds uniquement avec: TÂCHE: [ta correction]",
+        [{"role": "user", "content": f"Agent: {failed_agent} | Erreur: {error} | Tâche: {task}"}],
+        max_tokens=120
+    )
+    if ok and "TÂCHE:" in fix:
+        corrected = fix.split("TÂCHE:")[1].strip()
+        await bot.send_message(chat_id=chat_id, text=f"✅ *LENS — Correction*\n{corrected}", parse_mode=ParseMode.MARKDOWN)
+        return corrected
+    return f"Version simplifiée: {task[:80]}. Sois très concis."
+
+async def check_auto_delegation(result_text: str, current_agent: str, queue: list) -> list:
+    """Auto-délégation inter-agents selon les opportunités détectées."""
+    triggers = {
+        "scout":  (["score 9", "score 10", "opportunité exceptionnelle"], "forge",  "Conçois immédiatement le MVP pour la niche top identifiée par SCOUT."),
+        "oracle": (["aucun concurrent", "marché vide", "gap énorme"],      "spy",    "Analyse en urgence les concurrents de la niche sélectionnée."),
+        "lens":   (["scale", "taux de conversion élevé", "pipeline plein"],"pulse",  "Génère une campagne marketing agressive basée sur l'analyse LENS."),
+    }
+    if current_agent not in triggers:
+        return queue
+    keywords, agent_to_add, task_to_add = triggers[current_agent]
+    r = result_text.lower()
+    for kw in keywords:
+        if kw in r and not any(s[0] == agent_to_add for s in queue):
+            log.info(f"🔗 Auto-délégation: {current_agent} → {agent_to_add} (trigger: '{kw}')")
+            return [(agent_to_add, task_to_add)] + queue
+    return queue
+
+# ─────────────────────────────────────────────────────
+#  CHAÎNE AUTONOME COMPLÈTE
+# ─────────────────────────────────────────────────────
+
 async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
-    await bot.send_message(chat_id=chat_id, text="🔄 *Chaîne autonome lancée — 6 agents s'exécutent automatiquement*", parse_mode=ParseMode.MARKDOWN)
+    start_time = datetime.now()
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🚀 *CHAÎNE AUTONOME DÉMARRÉE*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "🧠 Pensée récursive : activée\n"
+            "🔄 Retry auto 429 : activé (65s)\n"
+            "⏱️ Délai entre agents : 10s\n"
+            "🔗 Auto-délégation : activée\n"
+            "🔧 LENS auto-correction : activé\n\n"
+            "_Ferme Telegram — je travaille seul._"
+        ),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
     memory = await db_load(user_id)
     context_summary = ""
+    completed = []
+    failed = []
 
-    for i, (agent_key, task) in enumerate(CHAIN_STEPS):
+    agent_queue = [
+        ("scout",  "Explore le marché. Génère 20 niches micro-SaaS scorées. Identifie la top 3."),
+        ("oracle", "Sélectionne la meilleure niche parmi celles de SCOUT. Justification + ICP."),
+        ("forge",  "Conçois le produit micro-SaaS MVP complet pour la niche choisie."),
+        ("pulse",  "Génère 5 posts LinkedIn et 3 emails cold outreach pour ce produit."),
+        ("seo",    "Génère 1 article SEO de 1000 mots pour ce produit."),
+        ("closer", "Génère 10 messages LinkedIn de prospection pour ce produit."),
+    ]
+
+    current_step = 0
+
+    while agent_queue:
+        agent_key, task = agent_queue.pop(0)
+        current_step += 1
+        total = current_step + len(agent_queue)
+
+        if agent_key not in AGENTS:
+            continue
+
         agent = AGENTS[agent_key]
-        await bot.send_message(chat_id=chat_id, text=f"⏳ Étape {i+1}/6 — {agent['emoji']} Agent {agent['name']} en cours...")
-        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        progress = "▓" * current_step + "░" * len(agent_queue)
 
-        full_task = task + (f"\n\nContexte : {context_summary}" if context_summary else "")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ *Étape {current_step}/{total}*\n`{progress}`\n\n{agent['emoji']} Agent *{agent['name']}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        # Pensée avant action
+        await think_aloud(bot, chat_id, agent["name"], task, context_summary)
+
+        # Délai quota
+        await asyncio.sleep(INTER_AGENT_DELAY)
+
+        full_task = task + (f"\n\nContexte: {truncate_context(context_summary)}" if context_summary else "")
         memory["history"].append({"role": "user", "content": full_task})
-        reply_text = gemini_call(agent["prompt"], memory["history"])
-        prefix = f"{agent['emoji']} *Agent {agent['name']}*\n{'─'*25}\n\n"
-        reply = prefix + reply_text
-        memory["history"].append({"role": "assistant", "content": reply_text})
-        context_summary += f"\n[{agent['name']}] : {reply_text[:200]}..."
 
-        chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
-        for chunk in chunks:
+        # Appel avec auto-retry
+        reply_text, success = gemini_call_safe(agent["prompt"], memory["history"], max_tokens=900)
+
+        # Échec → LENS répare
+        if not success:
+            failed.append(agent_key)
+            corrected_task = await lens_repair(bot, chat_id, agent["name"], reply_text, task)
+            await asyncio.sleep(INTER_AGENT_DELAY)
+            memory["history"].append({"role": "user", "content": corrected_task})
+            reply_text, success = gemini_call_safe(agent["prompt"], memory["history"], max_tokens=600)
+            if not success:
+                await bot.send_message(chat_id=chat_id, text=f"⚠️ *{agent['name']} ignoré* après 2 tentatives.", parse_mode=ParseMode.MARKDOWN)
+                memory["history"].append({"role": "assistant", "content": f"[{agent['name']} échoué]"})
+                continue
+
+        completed.append(agent_key)
+        memory["history"].append({"role": "assistant", "content": reply_text})
+        context_summary += f" | [{agent['name']}]: {reply_text[:150]}..."
+        if agent_key == "scout":
+            memory["cycles"] = memory.get("cycles", 0) + 1
+
+        full_reply = f"{agent['emoji']} *Agent {agent['name']}*\n{'─'*25}\n\n{reply_text}"
+        for chunk in [full_reply[i:i+3500] for i in range(0, len(full_reply), 3500)]:
             try:
                 await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.MARKDOWN)
             except:
                 await bot.send_message(chat_id=chat_id, text=chunk)
-        await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
-    memory["cycles"] += 1
-    memory["last_agent"] = "chain"
+        # Auto-délégation
+        agent_queue = await check_auto_delegation(reply_text, agent_key, agent_queue)
+
+    memory["last_agent"] = "chain_autonomous"
     await db_save(user_id, memory)
-    await bot.send_message(chat_id=chat_id, text="✅ *Chaîne autonome terminée ! 6 étapes complétées.*", parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+
+    duration = int((datetime.now() - start_time).total_seconds() / 60)
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "✅ *CHAÎNE AUTONOME TERMINÉE*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⏱️ Durée : {duration} min\n"
+            f"✅ Réussis : {len(completed)} ({', '.join(completed)})\n"
+            f"❌ Échoués : {len(failed)} ({', '.join(failed) if failed else 'aucun'})\n\n"
+            "📋 Tout est prêt à utiliser."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard()
+    )
 
 # ─────────────────────────────────────────────────────
 #  TRAITEMENT MESSAGES
