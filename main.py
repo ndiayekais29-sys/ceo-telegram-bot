@@ -1,4 +1,4 @@
-    """
+"""
 CEO-AI v4 — GEMINI 2.0 + AGENT AUTONOME COMPLET
 13 agents + Chaîne autonome 3 piliers + Supabase + Alertes matinales
 """
