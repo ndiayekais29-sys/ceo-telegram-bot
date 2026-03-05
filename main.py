@@ -1,12 +1,13 @@
-"""
-CEO-AI v4 — GEMINI EDITION CORRIGÉE (google-genai SDK)
-13 agents + Chaîne autonome + Supabase + Alertes matinales
+    """
+CEO-AI v4 — GEMINI 2.0 + AGENT AUTONOME COMPLET
+13 agents + Chaîne autonome 3 piliers + Supabase + Alertes matinales
 """
 
 import os
 import json
 import logging
 import asyncio
+import time
 from datetime import datetime
 import httpx
 from dotenv import load_dotenv
@@ -32,38 +33,64 @@ STRIPE_SECRET  = os.getenv("STRIPE_SECRET_KEY")
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("CEO_BOT")
 
-# Client Gemini — nouveau SDK stable
 client_gemini = genai.Client(api_key=GEMINI_KEY)
 MODEL = "gemini-2.0-flash"
 
 # ─────────────────────────────────────────────────────
-#  APPELS GEMINI — NOUVEAU SDK
+#  PILIER 3 — CONSTANTES QUOTA
 # ─────────────────────────────────────────────────────
 
-def gemini_call(system_prompt: str, history: list, max_tokens: int = 1500) -> str:
-    try:
-        # Construire les messages pour le nouveau SDK
-        contents = []
-        for msg in history[-20:]:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append(types.Content(
-                role=role,
-                parts=[types.Part(text=msg["content"])]
-            ))
+INTER_AGENT_DELAY = 10
+RETRY_DELAY_429   = 65
+MAX_RETRIES       = 3
+MAX_CONTEXT_CHARS = 400
 
-        response = client_gemini.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                max_output_tokens=max_tokens,
-                temperature=0.7,
+def truncate_context(text: str) -> str:
+    if len(text) <= MAX_CONTEXT_CHARS:
+        return text
+    return text[:MAX_CONTEXT_CHARS] + "...[résumé]"
+
+# ─────────────────────────────────────────────────────
+#  PILIER 1 — APPELS GEMINI AVEC AUTO-RETRY
+# ─────────────────────────────────────────────────────
+
+def gemini_call_safe(system_prompt: str, history: list, max_tokens: int = 1000):
+    """Gemini avec retry automatique 429 + mémoire courte."""
+    short_history = history[-6:]
+    contents = []
+    for msg in short_history:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(
+            role=role,
+            parts=[types.Part(text=truncate_context(msg["content"]))]
+        ))
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client_gemini.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    max_output_tokens=max_tokens,
+                    temperature=0.7,
+                )
             )
-        )
-        return response.text
-    except Exception as e:
-        log.error(f"Gemini error: {e}")
-        return f"❌ Erreur Gemini : {e}"
+            return response.text, True
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                wait = RETRY_DELAY_429 * attempt
+                log.warning(f"⏳ Quota 429 — Attente {wait}s (tentative {attempt}/{MAX_RETRIES})")
+                time.sleep(wait)
+            elif "503" in err or "unavailable" in err.lower():
+                time.sleep(30 * attempt)
+            else:
+                return f"ERREUR: {err}", False
+    return "ERREUR: Quota épuisé après tous les retries", False
+
+def gemini_call(system_prompt: str, history: list, max_tokens: int = 1200) -> str:
+    result, _ = gemini_call_safe(system_prompt, history, max_tokens)
+    return result
 
 def gemini_quick(system_prompt: str, message: str) -> str:
     try:
@@ -228,81 +255,14 @@ AGENTS = {
 }
 
 # ─────────────────────────────────────────────────────
-#  CHAÎNE AUTONOME
-# ─────────────────────────────────────────────────────
-
-CHAIN_STEPS = [
-    ("scout",   "Explore le marché. Génère 20 niches scorées."),
-    ("oracle",  "Sélectionne la meilleure niche avec justification complète."),
-    ("forge",   "Conçois le produit micro-SaaS complet pour la niche sélectionnée."),
-    ("pulse",   "Génère le plan marketing complet : 10 posts, 5 emails, 3 scripts, 5 hooks."),
-    ("seo",     "Génère un article SEO de 1500 mots pour ce produit."),
-    ("closer",  "Génère 20 messages LinkedIn de prospection pour ce produit."),
-]
-
-# ─────────────────────────────────────────────────────
-#  PILIER 3 — CONSTANTES QUOTA
-# ─────────────────────────────────────────────────────
-
-INTER_AGENT_DELAY = 10    # 10s entre chaque agent
-RETRY_DELAY_429   = 65    # 65s si erreur 429
-MAX_RETRIES       = 3     # Tentatives max
-MAX_CONTEXT_CHARS = 400   # Mémoire courte
-
-def truncate_context(text: str) -> str:
-    if len(text) <= MAX_CONTEXT_CHARS:
-        return text
-    return text[:MAX_CONTEXT_CHARS] + "...[résumé]"
-
-# ─────────────────────────────────────────────────────
-#  PILIER 1 — APPEL GEMINI AVEC AUTO-RETRY
-# ─────────────────────────────────────────────────────
-
-def gemini_call_safe(system_prompt: str, history: list, max_tokens: int = 1000):
-    """Gemini avec retry automatique 429 + mémoire courte."""
-    import time
-    short_history = history[-6:]
-    contents = []
-    for msg in short_history:
-        role = "user" if msg["role"] == "user" else "model"
-        contents.append(types.Content(
-            role=role,
-            parts=[types.Part(text=truncate_context(msg["content"]))]
-        ))
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = client_gemini.models.generate_content(
-                model=MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    max_output_tokens=max_tokens,
-                    temperature=0.7,
-                )
-            )
-            return response.text, True
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "quota" in err.lower():
-                wait = RETRY_DELAY_429 * attempt
-                log.warning(f"⏳ Quota 429 — Attente {wait}s (tentative {attempt}/{MAX_RETRIES})")
-                time.sleep(wait)
-            elif "503" in err or "unavailable" in err.lower():
-                time.sleep(30 * attempt)
-            else:
-                return f"ERREUR: {err}", False
-    return "ERREUR: Quota épuisé après tous les retries", False
-
-# ─────────────────────────────────────────────────────
-#  PILIER 2 — BOUCLE DE PENSÉE RÉCURSIVE
+#  PILIER 2 — PENSÉE RÉCURSIVE + AUTO-DÉLÉGATION
 # ─────────────────────────────────────────────────────
 
 async def think_aloud(bot: Bot, chat_id: int, agent_name: str, task: str, context: str):
-    """L'agent écrit ses pensées avant d'agir."""
     thought, ok = gemini_call_safe(
-        f"Tu es {agent_name}. Avant d'agir, réfléchis en 3 points : 💭 Pensées | 🧠 Raisonnement | 📋 Plan (max 120 mots). Contexte: {truncate_context(context)}",
+        f"Tu es {agent_name}. Réfléchis en 3 points avant d'agir : 💭 Pensées | 🧠 Raisonnement | 📋 Plan. Max 100 mots. Contexte: {truncate_context(context)}",
         [{"role": "user", "content": task}],
-        max_tokens=180
+        max_tokens=150
     )
     if ok:
         try:
@@ -311,7 +271,6 @@ async def think_aloud(bot: Bot, chat_id: int, agent_name: str, task: str, contex
             await bot.send_message(chat_id=chat_id, text=f"🧠 {agent_name}: {thought}")
 
 async def lens_repair(bot: Bot, chat_id: int, failed_agent: str, error: str, task: str) -> str:
-    """LENS analyse l'erreur et propose une tâche corrigée."""
     await bot.send_message(chat_id=chat_id, text=f"🔧 *LENS répare {failed_agent}*\nErreur: `{error[:150]}`", parse_mode=ParseMode.MARKDOWN)
     fix, ok = gemini_call_safe(
         "Tu es LENS. Un agent a échoué. Propose une version SIMPLIFIÉE de la tâche (max 80 mots). Réponds uniquement avec: TÂCHE: [ta correction]",
@@ -325,7 +284,6 @@ async def lens_repair(bot: Bot, chat_id: int, failed_agent: str, error: str, tas
     return f"Version simplifiée: {task[:80]}. Sois très concis."
 
 async def check_auto_delegation(result_text: str, current_agent: str, queue: list) -> list:
-    """Auto-délégation inter-agents selon les opportunités détectées."""
     triggers = {
         "scout":  (["score 9", "score 10", "opportunité exceptionnelle"], "forge",  "Conçois immédiatement le MVP pour la niche top identifiée par SCOUT."),
         "oracle": (["aucun concurrent", "marché vide", "gap énorme"],      "spy",    "Analyse en urgence les concurrents de la niche sélectionnée."),
@@ -337,7 +295,7 @@ async def check_auto_delegation(result_text: str, current_agent: str, queue: lis
     r = result_text.lower()
     for kw in keywords:
         if kw in r and not any(s[0] == agent_to_add for s in queue):
-            log.info(f"🔗 Auto-délégation: {current_agent} → {agent_to_add} (trigger: '{kw}')")
+            log.info(f"🔗 Auto-délégation: {current_agent} → {agent_to_add}")
             return [(agent_to_add, task_to_add)] + queue
     return queue
 
@@ -396,19 +354,14 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
             parse_mode=ParseMode.MARKDOWN
         )
 
-        # Pensée avant action
         await think_aloud(bot, chat_id, agent["name"], task, context_summary)
-
-        # Délai quota
         await asyncio.sleep(INTER_AGENT_DELAY)
 
         full_task = task + (f"\n\nContexte: {truncate_context(context_summary)}" if context_summary else "")
         memory["history"].append({"role": "user", "content": full_task})
 
-        # Appel avec auto-retry
         reply_text, success = gemini_call_safe(agent["prompt"], memory["history"], max_tokens=900)
 
-        # Échec → LENS répare
         if not success:
             failed.append(agent_key)
             corrected_task = await lens_repair(bot, chat_id, agent["name"], reply_text, task)
@@ -434,7 +387,6 @@ async def run_autonomous_chain(user_id: int, bot: Bot, chat_id: int):
                 await bot.send_message(chat_id=chat_id, text=chunk)
             await asyncio.sleep(1)
 
-        # Auto-délégation
         agent_queue = await check_auto_delegation(reply_text, agent_key, agent_queue)
 
     memory["last_agent"] = "chain_autonomous"
@@ -484,7 +436,7 @@ async def process_message(user_id: int, user_message: str, force_agent: str = No
     agent_key = force_agent or await route_message(user_message)
     memory["last_agent"] = agent_key
     if agent_key == "scout":
-        memory["cycles"] += 1
+        memory["cycles"] = memory.get("cycles", 0) + 1
     reply = await call_agent(agent_key, memory["history"])
     memory["history"].append({"role": "assistant", "content": reply})
     await db_save(user_id, memory)
@@ -499,7 +451,12 @@ async def send_morning_reports(bot: Bot):
         try:
             mem = await db_load(user_id)
             report = await generate_morning_report(mem)
-            await bot.send_message(chat_id=user_id, text=f"🌅 *BRIEF CEO DU JOUR*\n\n{report}", parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+            await bot.send_message(
+                chat_id=user_id,
+                text=f"🌅 *BRIEF CEO DU JOUR*\n\n{report}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard()
+            )
         except Exception as e:
             log.error(f"Erreur rapport {user_id}: {e}")
 
@@ -560,23 +517,29 @@ FORCE_AGENTS = {k: k.replace("agent_", "") for k in QUICK_MESSAGES if k.startswi
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
-        f"🤖 *CEO-AI v4 Gemini 2.0 — Bonjour {user.first_name} !*\n\n"
-        "13 agents spécialisés + chaîne autonome :\n\n"
+        f"🤖 *CEO-AI v4 — Bonjour {user.first_name} !*\n\n"
+        "13 agents + chaîne autonome 3 piliers :\n\n"
         "🔍 SCOUT · 🎯 ORACLE · ⚡ FORGE · 📣 PULSE\n"
         "📊 LENS · 🎨 DESIGN · 💻 CODE · 🔎 SPY\n"
         "📱 SOCIAL · 🎯 CLOSER · 💰 FINANCE · ⚖️ LEGAL · 📈 SEO\n\n"
-        "🔄 Chaîne autonome · 📋 Rapport matinal 9h · 💳 Stripe\n\n"
+        "🔄 Chaîne autonome · 📋 Rapport 9h · 💳 Stripe\n\n"
         "Écris-moi ou choisis un agent 👇",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard()
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard()
     )
 
 async def memory_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     mem = await db_load(update.effective_user.id)
     await update.message.reply_text(
-        f"🧠 *Mémoire :*\n\n• Cycles : {mem['cycles']}\n• Niche : {mem.get('niche') or 'Aucune'}\n"
-        f"• MRR : ${mem.get('mrr',0)}\n• Dépenses : ${mem.get('expenses',0)}\n"
-        f"• Dernier agent : {mem.get('last_agent') or 'Aucun'}\n• Messages : {len(mem['history'])}",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard()
+        f"🧠 *Mémoire :*\n\n"
+        f"• Cycles : {mem['cycles']}\n"
+        f"• Niche : {mem.get('niche') or 'Aucune'}\n"
+        f"• MRR : ${mem.get('mrr', 0)}\n"
+        f"• Dépenses : ${mem.get('expenses', 0)}\n"
+        f"• Dernier agent : {mem.get('last_agent') or 'Aucun'}\n"
+        f"• Messages : {len(mem['history'])}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_keyboard()
     )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -585,9 +548,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
         try:
-            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
+            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard() if i == len(chunks)-1 else None)
         except:
-            await update.message.reply_text(chunk, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
+            await update.message.reply_text(chunk,
+                reply_markup=main_keyboard() if i == len(chunks)-1 else None)
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -597,21 +562,28 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "memory":
         mem = await db_load(user_id)
-        await query.message.reply_text(f"🧠 Cycles: {mem['cycles']} | MRR: ${mem.get('mrr',0)} | Agent: {mem.get('last_agent','Aucun')}", reply_markup=main_keyboard())
+        await query.message.reply_text(
+            f"🧠 Cycles: {mem['cycles']} | MRR: ${mem.get('mrr',0)} | Agent: {mem.get('last_agent','Aucun')}",
+            reply_markup=main_keyboard()
+        )
         return
+
     if action == "report":
         await ctx.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
         mem = await db_load(user_id)
         report = await generate_morning_report(mem)
         try:
-            await query.message.reply_text(f"📋 *BRIEF CEO*\n\n{report}", parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
+            await query.message.reply_text(f"📋 *BRIEF CEO*\n\n{report}",
+                parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard())
         except:
             await query.message.reply_text(report, reply_markup=main_keyboard())
         return
+
     if action == "stripe":
         result = await check_stripe_revenue()
         await query.message.reply_text(result, reply_markup=main_keyboard())
         return
+
     if action == "chain":
         asyncio.create_task(run_autonomous_chain(user_id, ctx.bot, query.message.chat_id))
         return
@@ -623,12 +595,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chunks = [reply[i:i+4000] for i in range(0, len(reply), 4000)]
     for i, chunk in enumerate(chunks):
         try:
-            await query.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
+            await query.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN,
+                reply_markup=main_keyboard() if i == len(chunks)-1 else None)
         except:
-            await query.message.reply_text(chunk, reply_markup=main_keyboard() if i == len(chunks)-1 else None)
+            await query.message.reply_text(chunk,
+                reply_markup=main_keyboard() if i == len(chunks)-1 else None)
 
 async def post_init(app: Application):
     asyncio.create_task(morning_scheduler(app.bot))
+    log.info("⏰ Scheduler matinal activé")
+
+# ─────────────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────────────
 
 def main():
     if not TELEGRAM_TOKEN or not GEMINI_KEY:
@@ -640,7 +619,7 @@ def main():
     app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    log.info("✅ 13 agents actifs !")
+    log.info("✅ 13 agents + chaîne autonome + alertes actifs !")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
